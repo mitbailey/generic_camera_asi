@@ -17,10 +17,16 @@ use generic_camera_asi::{
     PropertyValue,
 };
 use refimage::{
-    CalcOptExp, ColorSpace, Debayer, DemosaicMethod, DynamicImage, FitsCompression, FitsWrite, GenericImage, GenericImageOwned, ImageProps, OptimumExposureBuilder, ToLuma
+    CalcOptExp, ColorSpace, Debayer, DemosaicMethod, DynamicImage, GenericImage, GenericImageOwned, ImageProps, OptimumExposureBuilder, ToLuma
 };
 
 use image::imageops::FilterType;
+
+// use std::{net::TcpListener, thread::spawn};
+use std::net::TcpListener;
+use refimage::DynamicImageOwned;
+// use image::open;
+use gencam_packet::{GenCamPacket, PacketType};
 
 #[derive(Debug)]
 struct ASICamconfig {
@@ -41,6 +47,11 @@ fn get_out_dir() -> PathBuf {
 }
 
 fn main() {
+    // Set up websocket listening.
+    let bind_addr = "127.0.0.1:9001";
+    let server = TcpListener::bind(bind_addr).unwrap();
+    eprintln!("Listening on: ws://{bind_addr}");
+
     let cfg = ASICamconfig::from_ini(&get_out_dir().join("asicam.ini")).unwrap_or_else(|_| {
         println!(
             "Error reading config file {:#?}, using defaults",
@@ -151,6 +162,7 @@ fn main() {
         .build()
         .unwrap();
     let mut last_saved = None;
+    let mut websockets = vec![];
     while !done.load(Ordering::SeqCst) {
         let _roi = cam.get_roi();
         // println!(
@@ -169,6 +181,7 @@ fn main() {
             let elapsed = estart.duration_since(last_saved.unwrap());
             elapsed > cfg.cadence
         };
+        let transmit = true;
         if let Some(exp) = img.get_exposure() {
             // save the raw FITS image
             if save {
@@ -206,6 +219,31 @@ fn main() {
                 dimg.save(dir_prefix.join(exp_start.format("%H%M%S%.3f.png").to_string()))
                     .expect("Error saving image");
             }
+
+            // Connect to all incoming clients.
+            for stream in server.incoming() {
+                let websocket = tungstenite::accept(stream.unwrap()).unwrap();
+                websockets.push(websocket);
+                eprintln!("New client connected!");
+            }
+
+            // Transmit the debayered image to all connected client if transmitting.
+            if transmit {
+                for websocket in &mut websockets {
+                    let dimg = DynamicImage::try_from(img.clone()).expect("Error converting image");
+                    let dimg = dimg.resize(1024, 1024, FilterType::Nearest);
+                    // Converts the DynamicImage to DynamicImageOwned.
+                    let img = DynamicImageOwned::try_from(dimg).expect("Could not convert image.");
+
+                    // Create a new GenCamPacket with the image data.
+                    let pkt = GenCamPacket::new(PacketType::Image, 0, 1024, 1024, Some(img.as_raw_u8().to_vec()));
+                    // Set msg to the serialized pkt.
+                    let msg = serde_json::to_vec(&pkt).unwrap();
+                    // Send the message.
+                    websocket.send(msg.into()).unwrap();
+                }
+            }
+
             // calculate the optimal exposure
             let dimg = img.to_luma().expect("Could not calculate luminance value");
             let (opt_exp, _) = dimg
